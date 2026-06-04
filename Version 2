@@ -1,0 +1,288 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+
+st.set_page_config(page_title="Treasury Revenue Prioritization", layout="wide")
+
+st.title("Probability-weighted treasury revenue prioritization model for existing borrowers")
+
+# --------------------------------------------------
+# Helper functions
+# --------------------------------------------------
+
+def clean_numeric_column(series):
+    return (
+        series.astype(str)
+        .str.replace("$", "", regex=False)
+        .str.replace(",", "", regex=False)
+        .str.replace("%", "", regex=False)
+        .str.strip()
+        .replace(["NA", "N/A", "na", "n/a", "nan", "None", "", "-", "--"], np.nan)
+        .pipe(pd.to_numeric, errors="coerce")
+        .fillna(0)
+    )
+
+
+def clean_text_column(series):
+    return (
+        series.fillna("")
+        .astype(str)
+        .str.strip()
+    )
+
+
+def calculate_deposit_revenue(cash_balance, deposit_yield=0.025):
+    cash_balance = pd.to_numeric(cash_balance, errors="coerce")
+
+    if pd.isna(cash_balance) or cash_balance <= 0:
+        return 0
+
+    return cash_balance * deposit_yield
+
+
+def calculate_probability(row):
+    score = 0
+
+    # Higher wallet share gap = better opportunity
+    if row["Wallet Share"] < 25:
+        score += 30
+    elif row["Wallet Share"] < 50:
+        score += 20
+    else:
+        score += 10
+
+    # More cash = better opportunity
+    if row["Latest Cash on Balance Sheet"] >= 100_000_000:
+        score += 30
+    elif row["Latest Cash on Balance Sheet"] >= 50_000_000:
+        score += 20
+    elif row["Latest Cash on Balance Sheet"] >= 10_000_000:
+        score += 10
+
+    # Larger hold = better relationship relevance
+    if row["Hold Amount"] >= 50_000_000:
+        score += 20
+    elif row["Hold Amount"] >= 25_000_000:
+        score += 10
+
+    # Existing TPS revenue relationship
+    if row["TPS Revenue"] > 0:
+        score += 10
+
+    # Risk rating logic
+    risk_rating = str(row["Risk Rating"]).upper().strip()
+
+    if risk_rating in ["1", "2", "3", "S1", "S2", "S3", "PASS"]:
+        score += 10
+    elif risk_rating in ["4", "S4"]:
+        score += 5
+    else:
+        score += 0
+
+    return min(score / 100, 1)
+
+
+def assign_priority(probability_weighted_revenue):
+    if probability_weighted_revenue >= 250_000:
+        return "High"
+    elif probability_weighted_revenue >= 100_000:
+        return "Medium"
+    else:
+        return "Low"
+
+
+# --------------------------------------------------
+# Upload workbook
+# --------------------------------------------------
+
+uploaded_file = st.file_uploader(
+    "Upload borrower Excel workbook",
+    type=["xlsx"]
+)
+
+if uploaded_file is not None:
+
+    try:
+        df = pd.read_excel(uploaded_file, engine="openpyxl")
+
+        # --------------------------------------------------
+        # Standardize column names
+        # --------------------------------------------------
+
+        df.columns = df.columns.astype(str).str.strip()
+
+        # Optional rename protection in case old workbook still says Risk Grading
+        if "Risk Grading" in df.columns and "Risk Rating" not in df.columns:
+            df = df.rename(columns={"Risk Grading": "Risk Rating"})
+
+        # --------------------------------------------------
+        # Required columns
+        # --------------------------------------------------
+
+        required_cols = [
+            "Borrower",
+            "Sponsor",
+            "Admin Agent",
+            "Risk Rating",
+            "Wallet Share",
+            "Hold Amount",
+            "Total Facility Commitments",
+            "Latest Cash on Balance Sheet",
+            "TPS Revenue"
+        ]
+
+        missing_cols = [col for col in required_cols if col not in df.columns]
+
+        if missing_cols:
+            st.error(f"Missing required columns: {missing_cols}")
+            st.stop()
+
+        # --------------------------------------------------
+        # Remove fully blank rows
+        # --------------------------------------------------
+
+        df = df.dropna(how="all")
+
+        # --------------------------------------------------
+        # Clean text columns
+        # --------------------------------------------------
+
+        text_cols = [
+            "Borrower",
+            "Sponsor",
+            "Admin Agent",
+            "Risk Rating"
+        ]
+
+        for col in text_cols:
+            df[col] = clean_text_column(df[col])
+
+        df["Risk Rating"] = df["Risk Rating"].str.upper().str.strip()
+
+        # --------------------------------------------------
+        # Clean numeric columns
+        # --------------------------------------------------
+
+        numeric_cols = [
+            "Wallet Share",
+            "Hold Amount",
+            "Total Facility Commitments",
+            "Latest Cash on Balance Sheet",
+            "TPS Revenue"
+        ]
+
+        for col in numeric_cols:
+            df[col] = clean_numeric_column(df[col])
+
+        # --------------------------------------------------
+        # Calculations
+        # --------------------------------------------------
+
+        df["Deposit Revenue Potential"] = df["Latest Cash on Balance Sheet"].apply(
+            lambda cash: calculate_deposit_revenue(cash)
+        )
+
+        df["Win Probability"] = df.apply(calculate_probability, axis=1)
+
+        df["Probability Weighted Revenue"] = (
+            df["Deposit Revenue Potential"] * df["Win Probability"]
+        )
+
+        df["Priority"] = df["Probability Weighted Revenue"].apply(assign_priority)
+
+        df = df.sort_values(
+            by="Probability Weighted Revenue",
+            ascending=False
+        )
+
+        # --------------------------------------------------
+        # Dashboard metrics
+        # --------------------------------------------------
+
+        st.subheader("Portfolio Summary")
+
+        col1, col2, col3, col4 = st.columns(4)
+
+        col1.metric("Borrowers", f"{len(df):,.0f}")
+        col2.metric("Total Cash", f"${df['Latest Cash on Balance Sheet'].sum():,.0f}")
+        col3.metric("Deposit Revenue Potential", f"${df['Deposit Revenue Potential'].sum():,.0f}")
+        col4.metric("Probability Weighted Revenue", f"${df['Probability Weighted Revenue'].sum():,.0f}")
+
+        # --------------------------------------------------
+        # Priority breakdown
+        # --------------------------------------------------
+
+        st.subheader("Priority Breakdown")
+
+        priority_summary = (
+            df.groupby("Priority")
+            .agg(
+                Borrowers=("Borrower", "count"),
+                Total_Cash=("Latest Cash on Balance Sheet", "sum"),
+                Revenue_Potential=("Deposit Revenue Potential", "sum"),
+                Probability_Weighted_Revenue=("Probability Weighted Revenue", "sum")
+            )
+            .reset_index()
+        )
+
+        st.dataframe(priority_summary, use_container_width=True)
+
+        # --------------------------------------------------
+        # Filters
+        # --------------------------------------------------
+
+        st.subheader("Borrower Detail")
+
+        selected_priority = st.multiselect(
+            "Filter by Priority",
+            options=sorted(df["Priority"].unique()),
+            default=sorted(df["Priority"].unique())
+        )
+
+        selected_sponsor = st.multiselect(
+            "Filter by Sponsor",
+            options=sorted(df["Sponsor"].dropna().unique()),
+            default=sorted(df["Sponsor"].dropna().unique())
+        )
+
+        filtered_df = df[
+            (df["Priority"].isin(selected_priority)) &
+            (df["Sponsor"].isin(selected_sponsor))
+        ]
+
+        display_cols = [
+            "Borrower",
+            "Sponsor",
+            "Admin Agent",
+            "Risk Rating",
+            "Wallet Share",
+            "Hold Amount",
+            "Total Facility Commitments",
+            "Latest Cash on Balance Sheet",
+            "TPS Revenue",
+            "Deposit Revenue Potential",
+            "Win Probability",
+            "Probability Weighted Revenue",
+            "Priority"
+        ]
+
+        st.dataframe(
+            filtered_df[display_cols],
+            use_container_width=True
+        )
+
+        # --------------------------------------------------
+        # Download output
+        # --------------------------------------------------
+
+        csv = filtered_df.to_csv(index=False).encode("utf-8")
+
+        st.download_button(
+            label="Download Prioritization Output",
+            data=csv,
+            file_name="treasury_prioritization_output.csv",
+            mime="text/csv"
+        )
+
+    except Exception as e:
+        st.error(f"An error occurred while processing the workbook: {e}")
