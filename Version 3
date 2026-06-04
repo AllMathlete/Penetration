@@ -1,0 +1,292 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.express as px
+
+st.set_page_config(
+    page_title="TPS Borrower Targeting Dashboard",
+    layout="wide"
+)
+
+st.title("TPS Borrower Targeting Dashboard")
+st.caption("Probability-weighted treasury revenue prioritization model for existing borrowers")
+
+uploaded_file = st.file_uploader("Upload borrower Excel workbook", type=["xlsx"])
+
+# -----------------------------
+# Helper functions
+# -----------------------------
+
+def clean_numeric(value):
+    if pd.isna(value):
+        return 0
+
+    value = str(value).strip()
+
+    if value.lower() in ["", "na", "n/a", "nan", "none", "-", "--", "#n/a"]:
+        return 0
+
+    value = (
+        value.replace("$", "")
+        .replace(",", "")
+        .replace("%", "")
+        .strip()
+    )
+
+    return pd.to_numeric(value, errors="coerce") if pd.notna(pd.to_numeric(value, errors="coerce")) else 0
+
+
+def clean_percent(value):
+    value = clean_numeric(value)
+
+    if value > 1:
+        return value / 100
+
+    return value
+
+
+def calculate_deposit_revenue(cash, tier_1_revenue, tier_2_revenue):
+    cash = clean_numeric(cash)
+
+    if cash >= 200_000_000:
+        return tier_2_revenue
+    if cash >= 50_000_000:
+        return tier_1_revenue
+    return 0
+
+
+def calculate_probability(row, assumptions):
+    priority = clean_numeric(row.get("Prioritization", 3))
+
+    if priority == 1:
+        probability = assumptions["priority_1"]
+    elif priority == 2:
+        probability = assumptions["priority_2"]
+    else:
+        probability = assumptions["priority_3"]
+
+    admin_agent = str(row.get("Admin Agent", "")).lower()
+    sponsor = str(row.get("Sponsor", "")).lower()
+    wallet_share = clean_percent(row.get("Wallet Share", 0))
+    competitors = clean_numeric(row.get("Top 15 Treasury Banks in Bank Group", 0))
+
+    adjustments = {}
+
+    if "bmo" in admin_agent:
+        adjustments["Admin agent"] = assumptions["admin_agent_bonus"]
+        probability += assumptions["admin_agent_bonus"]
+    else:
+        adjustments["Admin agent"] = 0
+
+    if sponsor not in ["", "nan", "none", "na", "n/a"]:
+        adjustments["Sponsor relationship"] = assumptions["sponsor_bonus"]
+        probability += assumptions["sponsor_bonus"]
+    else:
+        adjustments["Sponsor relationship"] = 0
+
+    if wallet_share >= assumptions["high_wallet_share_threshold"]:
+        adjustments["High wallet share"] = assumptions["high_wallet_share_bonus"]
+        probability += assumptions["high_wallet_share_bonus"]
+    elif wallet_share <= assumptions["low_wallet_share_threshold"]:
+        adjustments["Low wallet share"] = assumptions["low_wallet_share_penalty"]
+        probability += assumptions["low_wallet_share_penalty"]
+    else:
+        adjustments["Wallet share"] = 0
+
+    if competitors >= 2:
+        adjustments["Competition penalty"] = assumptions["competition_penalty"]
+        probability += assumptions["competition_penalty"]
+    elif competitors == 0:
+        adjustments["No competition bonus"] = assumptions["no_competition_bonus"]
+        probability += assumptions["no_competition_bonus"]
+    else:
+        adjustments["Competition"] = 0
+
+    probability = max(
+        assumptions["min_probability"],
+        min(probability, assumptions["max_probability"])
+    )
+
+    return probability, adjustments
+
+
+def assign_action(row):
+    probability = row["Win Probability"]
+    expected_revenue = row["Expected Revenue"]
+    deposit_revenue = row["Deposit Revenue Potential"]
+
+    if probability >= 0.60 and expected_revenue >= 250_000:
+        return "Pursue now"
+    if deposit_revenue >= 225_000 and probability >= 0.35:
+        return "Deposit-first pitch"
+    if probability >= 0.35 and expected_revenue >= 150_000:
+        return "Sponsor angle"
+    if probability >= 0.20:
+        return "Monitor"
+    return "Low priority"
+
+
+def create_reason_code(row):
+    reasons = []
+
+    if row["Prioritization"] == 1:
+        reasons.append("low treasury competition")
+    elif row["Prioritization"] == 2:
+        reasons.append("moderate treasury competition")
+    else:
+        reasons.append("heavy treasury competition")
+
+    if "bmo" in str(row["Admin Agent"]).lower():
+        reasons.append("BMO admin agent")
+
+    if row["Deposit Revenue Potential"] > 0:
+        reasons.append("deposit opportunity")
+
+    if row["Expected Revenue"] >= 250_000:
+        reasons.append("meaningful expected revenue")
+
+    return "; ".join(reasons)
+
+
+# -----------------------------
+# Sidebar assumptions
+# -----------------------------
+
+st.sidebar.header("Scenario Assumptions")
+
+priority_1 = st.sidebar.slider("Priority 1 Base Win Probability", 0, 100, 70) / 100
+priority_2 = st.sidebar.slider("Priority 2 Base Win Probability", 0, 100, 45) / 100
+priority_3 = st.sidebar.slider("Priority 3 Base Win Probability", 0, 100, 15) / 100
+
+admin_agent_bonus = st.sidebar.slider("Admin Agent Bonus", 0, 30, 10) / 100
+sponsor_bonus = st.sidebar.slider("Sponsor Relationship Bonus", 0, 20, 5) / 100
+no_competition_bonus = st.sidebar.slider("No Competition Bonus", 0, 30, 10) / 100
+competition_penalty = st.sidebar.slider("2+ Treasury Competitor Penalty", -50, 0, -15) / 100
+
+tier_1_deposit_revenue = st.sidebar.number_input(
+    "Tier 1 Deposit Revenue",
+    value=225000,
+    step=25000
+)
+
+tier_2_deposit_revenue = st.sidebar.number_input(
+    "Tier 2 Deposit Revenue",
+    value=550000,
+    step=50000
+)
+
+assumptions = {
+    "priority_1": priority_1,
+    "priority_2": priority_2,
+    "priority_3": priority_3,
+    "admin_agent_bonus": admin_agent_bonus,
+    "sponsor_bonus": sponsor_bonus,
+    "no_competition_bonus": no_competition_bonus,
+    "competition_penalty": competition_penalty,
+    "high_wallet_share_threshold": 0.30,
+    "low_wallet_share_threshold": 0.10,
+    "high_wallet_share_bonus": 0.10,
+    "low_wallet_share_penalty": -0.05,
+    "min_probability": 0.05,
+    "max_probability": 0.85
+}
+
+# -----------------------------
+# Main app
+# -----------------------------
+
+if uploaded_file is None:
+    st.info("Upload your borrower Excel workbook to begin.")
+    st.stop()
+
+df = pd.read_excel(uploaded_file, sheet_name="Borrower_Input")
+
+df.columns = df.columns.astype(str).str.strip()
+df = df.dropna(how="all")
+
+required_columns = [
+    "Borrower",
+    "Sponsor",
+    "Admin Agent",
+    "Risk Rating",
+    "Prioritization",
+    "Wallet Share",
+    "Hold Amount",
+    "Total Facility Commitments",
+    "Latest Cash on Balance Sheet",
+    "TPS Revenue Potential",
+    "Top 15 Treasury Banks in Bank Group",
+    "Revenue Assumption"
+]
+
+missing_columns = [col for col in required_columns if col not in df.columns]
+
+if missing_columns:
+    st.error(f"Missing required columns: {missing_columns}")
+    st.stop()
+
+# -----------------------------
+# Clean workbook inputs
+# -----------------------------
+
+text_columns = [
+    "Borrower",
+    "Sponsor",
+    "Admin Agent",
+    "Risk Rating",
+    "Revenue Assumption"
+]
+
+for col in text_columns:
+    df[col] = df[col].fillna("").astype(str).str.strip()
+
+numeric_columns = [
+    "Prioritization",
+    "Wallet Share",
+    "Hold Amount",
+    "Total Facility Commitments",
+    "Latest Cash on Balance Sheet",
+    "TPS Revenue Potential",
+    "Top 15 Treasury Banks in Bank Group"
+]
+
+for col in numeric_columns:
+    df[col] = df[col].apply(clean_numeric)
+
+# Calculate model outputs
+probability_results = df.apply(
+    lambda row: calculate_probability(row, assumptions),
+    axis=1
+)
+
+df["Win Probability"] = probability_results.apply(lambda x: x[0])
+df["Score Explanation"] = probability_results.apply(lambda x: x[1])
+
+df["Deposit Revenue Potential"] = df["Latest Cash on Balance Sheet"].apply(
+    lambda cash: calculate_deposit_revenue(
+        cash,
+        tier_1_deposit_revenue,
+        tier_2_deposit_revenue
+    )
+)
+
+df["Total Revenue Opportunity"] = (
+    df["TPS Revenue Potential"].fillna(0)
+    + df["Deposit Revenue Potential"].fillna(0)
+)
+
+df["Expected Revenue"] = (
+    df["Win Probability"] * df["Total Revenue Opportunity"]
+)
+
+df["Win Probability %"] = df["Win Probability"] * 100
+
+df["Action"] = df.apply(assign_action, axis=1)
+df["Reason Code"] = df.apply(create_reason_code, axis=1)
+
+df["Rank"] = df["Expected Revenue"].rank(
+    ascending=False,
+    method="dense"
+).astype(int)
+
+df = df.sort_values("Expected Revenue", ascending=False)
